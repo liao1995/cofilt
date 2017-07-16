@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.sparse import csr_matrix
 import pandas as pd
 import logging
 from datetime import datetime
@@ -27,6 +28,9 @@ parse.add_argument('--learning-rate', default=0.005, type=float, dest='alpha',
 	help='learning rate for SGD, simple ignore it when using ALS')
 parse.add_argument('--momentum', default=0, type=float,
         help='momentum for SGD, simple ignore it when using ALS')
+parse.add_argument('--dense', action='store_true', default=False,
+        help='active to use dense matrix representation. WARNING THAT \
+        there may be MEMORY ERROR for large matrix.')
 parse.add_argument('--no-tikhonov', action='store_false', default=True,
         dest='tikhonov', help='active to forbid tikhonov regularizer \
          (default ture). For more details about tikhonov regularizer, see: \
@@ -56,6 +60,7 @@ show_steps = args.show_steps
 test_steps = args.test_steps
 show_fig = args.show_fig
 log_file = args.log_file
+dense = args.dense
 tikhonov = args.tikhonov
 if solver == 'adam': 
     beta_1 = 0.9
@@ -69,8 +74,8 @@ start = datetime.now()
 df = pd.read_csv(data_file, 
          dtype={'biz_uin':np.int32, 'article_id': np.int32,
                 'read_cnt':np.int32})
-n_users = df.biz_uin.max()
-n_movies = df.article_id.max()
+n_users = df.biz_uin.max() + 1
+n_movies = df.article_id.max() + 1
 
 #df = pd.read_csv(data_file, 
 #        dtype={'userId':np.int32, 'movieId': np.int64, 
@@ -87,20 +92,45 @@ train_data = pd.DataFrame(train_data)
 test_data = pd.DataFrame(test_data)
 
 # construct rating matrix
-R = np.zeros((n_users, n_movies))
-for line in train_data.itertuples():
-    R[line[1]-1][line[2]-1] = line[3]
-T = np.zeros((n_users, n_movies))
-for line in test_data.itertuples():
-    T[line[1]-1][line[2]-1] = line[3]
-
+if dense:
+    R = np.zeros((n_users, n_movies))
+    for line in train_data.itertuples():
+        R[line[1]][line[2]] = line[3]
+    T = np.zeros((n_users, n_movies))
+    for line in test_data.itertuples():
+        T[line[1]][line[2]] = line[3]
+else:
+    rows = train_data.biz_uin
+    cols = train_data.article_id
+    data = train_data.read_cnt
+    R = csr_matrix((data, (rows, cols)))
+    rows = test_data.biz_uin
+    cols = test_data.article_id
+    data = test_data.read_cnt
+    T = csr_matrix((data, (rows, cols)))
+    del rows, cols, data
+    
 # initialization
 U = np.random.randn(k, n_users)     # user latent matrix
 M = np.random.randn(k, n_movies)    # movie latent matrix
-RI = R.copy()			    # index matrix
-RI[RI > 0] = 1
-TI = T.copy()
-TI[TI > 0] = 1
+
+if dense:
+    RI = R.copy()			    # index matrix
+    RI[RI > 0] = 1
+    TI = T.copy()
+    TI[TI > 0] = 1
+
+
+def sparse_rmse(A, U, M):
+    '''
+        calculate the rmse for U.T * M and A, here A is sparse matrix
+    '''
+    s = 0
+    for row in xrange(A.shape[0]):
+        rd = A.getrow(row).data - np.dot(U[:,row].T, M[:,A.getrow(row).nonzero()[1]])
+        s += np.sum(rd ** 2)
+    return np.sqrt(float(s) / A.nnz)
+
 
 # training
 start = datetime.now()
@@ -113,9 +143,12 @@ if solver == 'adam':
     last_m = 0
     t = 1
 for itr in range(max_epochs):
-    for ui, mj in zip(u_idx, m_idx):
+    for ii in xrange(R.nnz):
+        ui = u_idx[ii]
+        mj = m_idx[ii]
         if solver == 'sgd':		           # SGD optimizer 
-            delta = R[ui][mj] - np.dot(U[:,ui].T, M[:,mj])
+            if dense: delta = R[ui][mj] - np.dot(U[:,ui].T, M[:,mj])
+            else: delta = R.data[ii] - np.dot(U[:,ui].T, M[:,mj]) 
             v = momentum * last_v + alpha * \
                          (-delta * M[:,mj] + weight_decay * U[:,ui])
             U[:,ui] -= v
@@ -124,7 +157,8 @@ for itr in range(max_epochs):
             M[:,mj] -= v
             last_v = v
         elif solver == 'adam':
-            delta = R[ui][mj] - np.dot(U[:,ui].T, M[:,mj])
+            if dense: delta = R[ui][mj] - np.dot(U[:,ui].T, M[:,mj])
+            else: delta = R.data[ii] - np.dot(U[:,ui].T, M[:,mj]) 
             g = -delta * M[:,mj] + weight_decay * U[:,ui]
             m = beta_1 * last_m + (1 - beta_1) * g
             v = beta_2 * last_v + (1 - beta_2) * g**2
@@ -139,24 +173,32 @@ for itr in range(max_epochs):
             t += 1
         elif solver == 'als':	                   # ALS optimizer
             # fix M, solve Ui => AUi = b
-            M_Ui = M[:,R[ui,:]>0] 	           # movies that ui rated
+            if dense: M_Ui = M[:,R[ui,:]>0]        # movies that ui rated
+            else: M_Ui = M[:,R.getrow(ui).nonzero()[1]]
             regularizer = weight_decay * np.eye(k)
             if  tikhonov: regularizer *= len(M_Ui)
-            A_Ui = np.dot(M_Ui, M_Ui.T) + regularizer # A
-            b_Ui = np.dot(M_Ui, R[ui,R[ui,:]>0].T)                 # b
+            A_Ui = np.dot(M_Ui, M_Ui.T) + regularizer              # A
+            if dense: b_Ui = np.dot(M_Ui, R[ui,R[ui,:]>0].T)       # b
+            else: b_Ui = np.dot(M_Ui, R.getrow(ui).data.T)
             #U[:,ui] = np.linalg.solve(A_Ui, b_Ui)  # update Ui
             U[:,ui] = np.dot(np.linalg.inv(A_Ui), b_Ui)
             # fix U, solve Mj => AMj = b
-            U_Mj = U[:,R[:,mj]>0]	           # users who rated mj 
+            if dense: U_Mj = U[:,R[:,mj]>0]	   # users who rated mj 
+            else: U_Mj = U[:,R.getcol(mj).nonzero()[0]]
             regularizer = weight_decay * np.eye(k)
             if  tikhonov: regularizer *= len(U_Mj)
-            A_Mj = np.dot(U_Mj, U_Mj.T) + regularizer # A
-            b_Mj = np.dot(U_Mj, R[R[:,mj]>0,mj])                   # b   
+            A_Mj = np.dot(U_Mj, U_Mj.T) + regularizer               # A
+            if dense: b_Mj = np.dot(U_Mj, R[R[:,mj]>0,mj])          # b
+            else: b_Mj = np.dot(U_Mj, R.getcol(mj).data)   
             #M[:,mj] = np.linalg.solve(A_Mj, b_Mj)  # update Mj
             M[:,mj] = np.dot(np.linalg.inv(A_Mj), b_Mj)
-    train_rmse = np.sqrt(np.sum((RI*(R - np.dot(U.T, M)))**2)/len(R[R>0]))
+    if dense: 
+        train_rmse = np.sqrt(np.sum((RI*(R - np.dot(U.T, M)))**2)/len(R[R>0]))
+        test_rmse = np.sqrt(np.sum((TI*(T - np.dot(U.T, M)))**2) / len(T[T>0]))
+    else: 
+        train_rmse = sparse_rmse(R, U, M)
+        test_rmse = sparse_rmse(T, U, M)
     train_loss.append( train_rmse )
-    test_rmse = np.sqrt(np.sum((TI*(T - np.dot(U.T, M)))**2) / len(T[T>0]))
     test_loss.append( test_rmse )
     if abs(train_rmse-last_loss) < epsilon: break  # early stop
     last_loss = train_rmse
