@@ -15,24 +15,32 @@ parse = argparse.ArgumentParser(
 		' the collaborative filtering problem.' )
 parse.add_argument('input', type=str, 
 	help='input data file with csv format')
-parse.add_argument('--solver', type=str, choices=['sgd','als'],
+parse.add_argument('--solver', type=str, choices=['sgd','als', 'adam'],
 	default='sgd', help='optimizing method')
-parse.add_argument('--max-epochs', default=100, type=int, 
+parse.add_argument('--max-epochs', default=200, type=int, 
 	help='maximum epochs for training')
 parse.add_argument('--factor', default=20, type=int, dest='k',
 	help='dimension of latent feature space')
 parse.add_argument('--weight-decay', default=0.1, type=float,
 	help='value controls the regularization strength')
-parse.add_argument('--learning-rate', default=0.01, type=float, dest='alpha',
+parse.add_argument('--learning-rate', default=0.005, type=float, dest='alpha',
 	help='learning rate for SGD, simple ignore it when using ALS')
+parse.add_argument('--momentum', default=0, type=float,
+        help='momentum for SGD, simple ignore it when using ALS')
+parse.add_argument('--no-tikhonov', action='store_false', default=True,
+        dest='tikhonov', help='active to forbid tikhonov regularizer \
+         (default ture). For more details about tikhonov regularizer, see: \
+         Y. Zhou, D. W., R. S., R. P. (2010). Large-Scale Parallel \
+         Collaborative Filtering for the Netflix Prize. Lecture Notes \
+         in Computer Science, 5034, 337-347.')
 parse.add_argument('--early-stop', default=1e-4, type=float, dest='epsilon', 
         help='finish training when loss decrease less than epsilon')
 parse.add_argument('--show-steps', default=10, type=int, 
 	help='value controls how many steps to show training info')
 parse.add_argument('--test-steps', default=20, type=int,
 	help='value controls how many steps to show testing info')
-parse.add_argument('--show-fig', default=True, type=bool,
-	help='show loss figure or not when completed training')
+parse.add_argument('--show-fig', action='store_true', default=False,
+	help='active to show loss figure when completed training')
 parse.add_argument('--log-file', default=None, type=str,
 	help='provide filename for writing log, leave none when no need')
 args = parse.parse_args()
@@ -42,20 +50,34 @@ max_epochs = args.max_epochs
 k = args.k
 weight_decay = args.weight_decay
 alpha = args.alpha
+momentum = args.momentum
 epsilon = args.epsilon
 show_steps = args.show_steps
 test_steps = args.test_steps
 show_fig = args.show_fig
 log_file = args.log_file
+tikhonov = args.tikhonov
+if solver == 'adam': 
+    beta_1 = 0.9
+    beta_2 = 0.999
+    m_value = 1e-8
 
 # read data
 start = datetime.now()
-#data_file = os.path.join('ml-latest-small', 'ratings.csv')
+
+# biz - article relation
 df = pd.read_csv(data_file, 
-        dtype={'userId':np.int32, 'movieId': np.int64, 
-            'rating': np.float32, 'timestamp': np.int64})
-n_users = df.userId.max()
-n_movies = df.movieId.max()
+         dtype={'biz_uin':np.int32, 'article_id': np.int32,
+                'read_cnt':np.int32})
+n_users = df.biz_uin.max()
+n_movies = df.article_id.max()
+
+#df = pd.read_csv(data_file, 
+#        dtype={'userId':np.int32, 'movieId': np.int64, 
+#            'rating': np.float32, 'timestamp': np.int64})
+#n_users = df.userId.max()
+#n_movies = df.movieId.max()
+
 print ('Max user ID: ' + str(n_users) + ' Max movie ID: ' + str(n_movies))
 end = datetime.now()
 print ('Escape time (loading data): ' + str(end - start))
@@ -86,25 +108,52 @@ train_loss = list()
 test_loss = list()
 u_idx, m_idx = R.nonzero()
 last_loss = 0                       # loss of last epoch, for early stop
+last_v = 0 
+if solver == 'adam': 
+    last_m = 0
+    t = 1
 for itr in range(max_epochs):
     for ui, mj in zip(u_idx, m_idx):
         if solver == 'sgd':		           # SGD optimizer 
             delta = R[ui][mj] - np.dot(U[:,ui].T, M[:,mj])
-            U[:,ui] += alpha * (delta * M[:,mj] - weight_decay * U[:,ui]) 
-            M[:,mj] += alpha * (delta * U[:,ui] - weight_decay * M[:,mj])
+            v = momentum * last_v + alpha * \
+                         (-delta * M[:,mj] + weight_decay * U[:,ui])
+            U[:,ui] -= v
+            v = momentum * last_v + alpha * \
+                         (-delta * U[:,ui] + weight_decay * M[:,mj])
+            M[:,mj] -= v
+            last_v = v
+        elif solver == 'adam':
+            delta = R[ui][mj] - np.dot(U[:,ui].T, M[:,mj])
+            g = -delta * M[:,mj] + weight_decay * U[:,ui]
+            m = beta_1 * last_m + (1 - beta_1) * g
+            v = beta_2 * last_v + (1 - beta_2) * g**2
+            a = alpha * np.sqrt(1-beta_2**t)/(1-beta_1**t)
+            U[:,ui] -= a * m / (np.sqrt(v)+m_value)
+            g = -delta * U[:,ui] + weight_decay * M[:,mj]
+            m = beta_1 * last_m + (1 - beta_1) * g
+            v = beta_2 * last_v + (1 - beta_2) * g**2
+            M[:,mj] -= a * m / (np.sqrt(v)+m_value)
+            last_v = v
+            last_m = m
+            t += 1
         elif solver == 'als':	                   # ALS optimizer
             # fix M, solve Ui => AUi = b
             M_Ui = M[:,R[ui,:]>0] 	           # movies that ui rated
-            A_Ui = np.dot(M_Ui, M_Ui.T) + weight_decay * np.eye(k) # A
+            regularizer = weight_decay * np.eye(k)
+            if  tikhonov: regularizer *= len(M_Ui)
+            A_Ui = np.dot(M_Ui, M_Ui.T) + regularizer # A
             b_Ui = np.dot(M_Ui, R[ui,R[ui,:]>0].T)                 # b
             #U[:,ui] = np.linalg.solve(A_Ui, b_Ui)  # update Ui
-            U[:,ui] = np.dot(np.linalg.pinv(A_Ui), b_Ui)
+            U[:,ui] = np.dot(np.linalg.inv(A_Ui), b_Ui)
             # fix U, solve Mj => AMj = b
             U_Mj = U[:,R[:,mj]>0]	           # users who rated mj 
-            A_Mj = np.dot(U_Mj, U_Mj.T) + weight_decay * np.eye(k) # A
+            regularizer = weight_decay * np.eye(k)
+            if  tikhonov: regularizer *= len(U_Mj)
+            A_Mj = np.dot(U_Mj, U_Mj.T) + regularizer # A
             b_Mj = np.dot(U_Mj, R[R[:,mj]>0,mj])                   # b   
             #M[:,mj] = np.linalg.solve(A_Mj, b_Mj)  # update Mj
-            M[:,mj] = np.dot(np.linalg.pinv(A_Mj), b_Mj)
+            M[:,mj] = np.dot(np.linalg.inv(A_Mj), b_Mj)
     train_rmse = np.sqrt(np.sum((RI*(R - np.dot(U.T, M)))**2)/len(R[R>0]))
     train_loss.append( train_rmse )
     test_rmse = np.sqrt(np.sum((TI*(T - np.dot(U.T, M)))**2) / len(T[T>0]))
