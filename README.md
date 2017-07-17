@@ -26,6 +26,10 @@ Dependencies
 * **Required:** The [**python scikit-learn
   package**](http://scikit-learn.org) at version 0.18 or
   newer.
+  
+* **Required:** The [**python h5py
+  package**](http://www.h5py.org/) at version 2.6 or
+  newer.
 
 * **Optional:** The [**python matplotlib
   package**](https://pypi.python.org/pypi/matplotlib) at version 1.4.2
