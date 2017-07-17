@@ -1,4 +1,5 @@
 import numpy as np
+import h5py
 from scipy.sparse import csr_matrix
 import pandas as pd
 import logging
@@ -18,6 +19,8 @@ parse.add_argument('input', type=str,
 	help='input data file with csv format')
 parse.add_argument('--solver', type=str, choices=['sgd','als', 'adam'],
 	default='sgd', help='optimizing method')
+parse.add_argument('--weights', type=str, default=None,
+        help='weights which can be loaded to finetune the model.') 
 parse.add_argument('--max-epochs', default=200, type=int, 
 	help='maximum epochs for training')
 parse.add_argument('--factor', default=20, type=int, dest='k',
@@ -39,18 +42,22 @@ parse.add_argument('--no-tikhonov', action='store_false', default=True,
          in Computer Science, 5034, 337-347.')
 parse.add_argument('--early-stop', default=1e-4, type=float, dest='epsilon', 
         help='finish training when loss decrease less than epsilon')
+parse.add_argument('--save-steps', default=None, type=int,
+        help='value controls how many steps to store weights, \
+        leave None to store weights when finished training')
 parse.add_argument('--show-steps', default=10, type=int, 
 	help='value controls how many steps to show training info')
 parse.add_argument('--test-steps', default=20, type=int,
 	help='value controls how many steps to show testing info')
 parse.add_argument('--show-fig', action='store_true', default=False,
-	help='active to show loss figure when completed training')
+	help='active to show loss figure when finished training')
 parse.add_argument('--log-file', default=None, type=str,
 	help='provide filename for writing log, leave none when no need')
 args = parse.parse_args()
 data_file = args.input
 solver = args.solver
 max_epochs = args.max_epochs
+if args.save_steps == None: save_steps = max_epochs
 k = args.k
 weight_decay = args.weight_decay
 alpha = args.alpha
@@ -62,6 +69,7 @@ show_fig = args.show_fig
 log_file = args.log_file
 dense = args.dense
 tikhonov = args.tikhonov
+weights = args.weights
 if solver == 'adam': 
     beta_1 = 0.9
     beta_2 = 0.999
@@ -70,18 +78,10 @@ if solver == 'adam':
 # read data
 start = datetime.now()
 
-# biz - article relation
 df = pd.read_csv(data_file, 
-         dtype={'biz_uin':np.int32, 'article_id': np.int32,
-                'read_cnt':np.int32})
-n_users = df.biz_uin.max() + 1
-n_movies = df.article_id.max() + 1
-
-#df = pd.read_csv(data_file, 
-#        dtype={'userId':np.int32, 'movieId': np.int64, 
-#            'rating': np.float32, 'timestamp': np.int64})
-#n_users = df.userId.max()
-#n_movies = df.movieId.max()
+         dtype={'user_uin':np.int32, 'biz_uin': np.int32})
+n_users = df.user_uin.max() + 1
+n_movies = df.biz_uin.max() + 1
 
 print ('Max user ID: ' + str(n_users) + ' Max movie ID: ' + str(n_movies))
 end = datetime.now()
@@ -100,19 +100,26 @@ if dense:
     for line in test_data.itertuples():
         T[line[1]][line[2]] = line[3]
 else:
-    rows = train_data.biz_uin
-    cols = train_data.article_id
-    data = train_data.read_cnt
+    rows = train_data.user_uin
+    cols = train_data.biz_uin
+    data = np.ones(len(rows))
     R = csr_matrix((data, (rows, cols)))
-    rows = test_data.biz_uin
-    cols = test_data.article_id
-    data = test_data.read_cnt
+    rows = test_data.user_uin
+    cols = test_data.biz_uin
+    data = np.ones(len(rows))
     T = csr_matrix((data, (rows, cols)))
     del rows, cols, data
-    
+
 # initialization
-U = np.random.randn(k, n_users)     # user latent matrix
-M = np.random.randn(k, n_movies)    # movie latent matrix
+if weights is not None:
+    f = h5py.File(weights, 'r')
+    U = f['U'][:]    
+    M = f['M'][:]
+    f.close()
+    logging.info('loaded model from ' + weights)
+else:
+    U = np.random.randn(k, n_users)     # user latent matrix
+    M = np.random.randn(k, n_movies)    # movie latent matrix
 
 if dense:
     RI = R.copy()			    # index matrix
@@ -206,6 +213,13 @@ for itr in range(max_epochs):
         logging.info('it ' + str(itr) + ' rmse(train) = %.3f' % train_rmse)
     if itr % test_steps == 0:
         logging.info('it ' + str(itr) + ' rmse(TEST) = %.3f' % test_rmse)
+    if (itr + 1) % save_steps == 0:
+        model_name = 'weights-k%d-it%d.hdf5' % (k, itr) 
+        f = h5py.File(model_name, 'w')
+        f.create_dataset('U', data = U)
+        f.create_dataset('M', data = M)
+        f.close()
+        logging.info('saved model ' + model_name)
 logging.info('it ' + str(itr) + ' rmse(train) = %.3f' % train_rmse)
 logging.info('it ' + str(itr) + ' rmse(TEST) = %.3f' % test_rmse)
 end = datetime.now()
